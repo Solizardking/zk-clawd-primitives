@@ -22,3 +22,6 @@ test-ledger/
 *.secret.json
 *.proof.local.json
 *.vk.local.json
+dark-clawd/
+easytrace/
+zk-clawd/
