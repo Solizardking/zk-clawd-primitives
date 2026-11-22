@@ -5,6 +5,13 @@
 > Powers the on-chain identity, attestation, and encrypted-state
 > layer for the Clawd agent fleet.
 
+## Implementation status
+
+The on-chain flows below describe the intended design. The SDK currently encodes
+instruction data as JSON and the compressed-state handlers are incomplete.
+For an executable off-chain workflow, start with the
+[Model Kit artifact handoff](docs/INTEGRATION.md#model-kit-artifact-handoff).
+
 ## What this is
 
 A focused, audited-friendly on-chain program plus a TypeScript SDK

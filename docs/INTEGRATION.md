@@ -96,3 +96,27 @@ The catalog can show that ZK capability exists; it should not silently arm it.
 6. Publish the final `MANIFEST.json` alongside package versions and deployment IDs.
 7. Run `node --test cloudflare/install-worker.test.mjs`.
 8. Verify the deployed Worker metadata endpoint before announcing install URLs.
+
+## Model Kit artifact handoff
+
+Use Python 3.11+ and the training repository's
+[CAAP/1.0 preview endpoint](https://github.com/Solizardking/solana-clawd-ai-training/blob/3ac97317cd04ab008edf4d9ecddc7ee931439021/model-kit/backend/main.py#L1395-L1405).
+Set the registration request's `model_hash` to `sha256:` followed by the digest
+of one exact artifact file, such as an adapter. Save the response from
+`POST /api/register/preview` as `preview.json`. From the primitives repo root:
+
+```sh
+jq -e 'select(.ok == true and .hash_was_generated == false) | .payload' preview.json > payload.json &&
+python3 scripts/prepare_model_attestation.py payload.json adapter.safetensors
+```
+
+The helper streams the artifact and checks its digest against the payload.
+It prints the SDK's `modelHash` and `payloadCommitment` as 64-character hex
+strings. Decode each to 32 bytes before passing it to the SDK. Archive that
+exact payload file with the artifact digest. Whitespace, timestamps, and key
+order all affect its SHA-256 commitment. These digests identify the submitted
+files. Proving a training run or inference result requires a separately defined
+circuit and witness.
+
+Run the offline checks with
+`python3 -m unittest discover -s tests -p 'test_model_attestation.py'`.
