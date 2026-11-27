@@ -10,7 +10,7 @@
  *   zk-shark-agent attest <modelHash> <payloadCommitment> <proof.json> [--context <ctx>]
  *     Build and (when a signer is attached) submit a publish_attestation
  *     instruction. The proof is read from <proof.json> as
- *     `{ a, b, c, verifyingKey }` (hex strings).
+ *     `{ a, b, c }` (hex strings; the verifying key is pinned on-chain).
  *
  *   zk-shark-agent commit <ciphertextCommitment> <stateVersion> <proof.json> [--model <modelHash>]
  *     Build a commit_encrypted_state instruction.

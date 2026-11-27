@@ -65,8 +65,7 @@ The proof JSON shape is:
 {
   "a": "0x0102...",
   "b": "0x0102...",
-  "c": "0x0102...",
-  "verifyingKey": "0x0102..."
+  "c": "0x0102..."
 }
 ```
 
@@ -80,7 +79,7 @@ const agent = await ZkSharkAgent.fromEnv();
 const result = await agent.attestModel({
   modelHash: new Uint8Array(32),
   payloadCommitment: new Uint8Array(32),
-  proof: { a, b, c, verifyingKey },
+  proof: { a, b, c }, // verifying key is pinned on-chain
   context: "model-attest:v1:my-model",
 });
 

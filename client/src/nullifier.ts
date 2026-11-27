@@ -1,114 +1,105 @@
 /**
- * Nullifier computation.
+ * Nullifier computation — v1, mirrors `crates/clawd-zk-core`.
  *
- * A nullifier is a deterministic 32-byte hash that proves an action was
- * taken exactly once. We compute it as:
+ *     nullifier = SHA-256( "clawd-zk-nullifier/v1"
+ *                          ‖ u32le(|secret|)  ‖ secret
+ *                          ‖ u32le(|context|) ‖ context
+ *                          ‖ u64le(nonce) )
  *
- *     nullifier = Poseidon(secret, context)
- *
- * using the BN254 field. The `secret` is the attester's signing key
- * (or a domain-separated sub-key derived from it). The `context` is
- * a domain tag that prevents cross-action collisions (e.g.
- * "model-attestation-2026-06-15").
- *
- * For environments where Poseidon is not available (e.g. browser
- * without WASM), we fall back to a SHA-256-based construction that
- * is still collision-resistant per (secret, context) pair.
+ * The length prefixes and domain tag make the encoding injective (proved
+ * in Lean: `formal/lean/ClawdZk/Nullifier.lean`, `preimage_injective`),
+ * so two different (secret, context, nonce) triples can only collide
+ * through a SHA-256 collision. The previous construction,
+ * `sha256(secret ‖ context ‖ nonce)`, was not injective and is removed.
+ * `test/vectors.test.ts` checks this file against the Lean-generated vectors.
  */
 
 import { createHash } from "node:crypto";
 import type { PublicKey } from "@solana/web3.js";
 import type { Bytes32 } from "./types.js";
 
-/** Inputs to `computeNullifier`. */
 export interface NullifierInputs {
-  /** 32+ bytes of secret material (e.g. derived signing subkey). */
+  /** 16+ bytes of secret material (e.g. a derived signing subkey). */
   secret: Uint8Array;
-  /** Arbitrary context tag (e.g. "model-attest:v1:<model_hash>"). */
+  /** Context tag (e.g. "model-attest:v1:<model_hash>"). */
   context: Uint8Array | string;
-  /** Optional nonce to allow multiple nullifiers per (secret, context). */
-  nonce?: Uint8Array | number;
+  /** u64 nonce; defaults to 0. */
+  nonce?: bigint | number;
 }
 
-/**
- * Compute a deterministic 32-byte nullifier.
- *
- * Uses SHA-256(secret || context || nonce) for portability. In
- * production circuits, replace the inner hash with Poseidon for
- * SNARK-friendliness.
- */
-export async function computeNullifier(
-  inputs: NullifierInputs,
-): Promise<Bytes32> {
-  const { secret, context, nonce } = inputs;
-  if (secret.length < 16) {
+export const NULLIFIER_DOMAIN_V1 = new TextEncoder().encode("clawd-zk-nullifier/v1");
+
+const U32_MAX = 0xffff_ffff;
+const U64_MAX = (1n << 64n) - 1n;
+
+function lenPrefixed(field: Uint8Array): Uint8Array {
+  if (field.length > U32_MAX) throw new Error("field longer than u32::MAX bytes");
+  const out = new Uint8Array(4 + field.length);
+  new DataView(out.buffer).setUint32(0, field.length, true);
+  out.set(field, 4);
+  return out;
+}
+
+/** The exact bytes that are hashed. Matches `clawd_zk_core::nullifier_preimage`. */
+export function nullifierPreimage(
+  secret: Uint8Array,
+  context: Uint8Array | string,
+  nonce: bigint | number = 0,
+): Uint8Array {
+  const ctx = typeof context === "string" ? new TextEncoder().encode(context) : context;
+  const n = BigInt(nonce);
+  if (n < 0n || n > U64_MAX) throw new Error("nonce must fit in u64");
+  const nonceBytes = new Uint8Array(8);
+  new DataView(nonceBytes.buffer).setBigUint64(0, n, true);
+  const parts = [NULLIFIER_DOMAIN_V1, lenPrefixed(secret), lenPrefixed(ctx), nonceBytes];
+  const out = new Uint8Array(parts.reduce((s, p) => s + p.length, 0));
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
+}
+
+/** Deterministic 32-byte nullifier. Matches `clawd_zk_core::compute_nullifier`. */
+export async function computeNullifier(inputs: NullifierInputs): Promise<Bytes32> {
+  if (inputs.secret.length < 16) {
     throw new Error("Nullifier secret must be at least 16 bytes.");
   }
-  const contextBytes =
-    typeof context === "string" ? new TextEncoder().encode(context) : context;
-  const nonceBytes =
-    typeof nonce === "number"
-      ? u64ToBytes(BigInt(nonce))
-      : nonce ?? new Uint8Array(0);
-
-  const hasher = createHash("sha256");
-  hasher.update(secret);
-  hasher.update(contextBytes);
-  hasher.update(nonceBytes);
-  const out = hasher.digest();
-  return out as Bytes32;
+  const pre = nullifierPreimage(inputs.secret, inputs.context, inputs.nonce ?? 0);
+  return new Uint8Array(createHash("sha256").update(pre).digest()) as Bytes32;
 }
 
-/** Compute N nullifiers in one go, each with a unique nonce. */
+/** N nullifiers for one (secret, context), nonces 0..count-1. */
 export async function computeNullifierBatch(
   baseInputs: Omit<NullifierInputs, "nonce">,
   count: number,
 ): Promise<Bytes32[]> {
   const out: Bytes32[] = [];
   for (let i = 0; i < count; i++) {
-    out.push(
-      await computeNullifier({ ...baseInputs, nonce: u32ToBytes(i) }),
-    );
+    out.push(await computeNullifier({ ...baseInputs, nonce: BigInt(i) }));
   }
   return out;
 }
 
-function u32ToBytes(n: number): Uint8Array {
-  const b = new Uint8Array(4);
-  new DataView(b.buffer).setUint32(0, n, true);
-  return b;
-}
-
-function u64ToBytes(n: bigint): Uint8Array {
-  const b = new Uint8Array(8);
-  new DataView(b.buffer).setBigUint64(0, n, true);
-  return b;
-}
-
-/** Re-export the on-chain address derivation so the client and program agree. */
+/** On-chain address seed prefixes (`programs/clawd-zk/src/state.rs`). */
 export const NULLIFIER_PREFIX = new TextEncoder().encode("clawd-zk-nullifier");
+export const ATTESTATION_PREFIX = new TextEncoder().encode("clawd-zk-attest");
+export const STATE_PREFIX = new TextEncoder().encode("clawd-zk-state");
 
-/**
- * Derive the compressed-account address for a given nullifier and
- * address tree. The address is what the Light Protocol address tree
- * uses for uniqueness proofs.
- */
-export async function deriveNullifierAddress(
-  programId: PublicKey,
-  addressTree: PublicKey,
-  nullifier: Bytes32,
-): Promise<{ address: PublicKey; seed: Uint8Array }> {
-  // The actual derivation uses the Light SDK. We import dynamically
-  // because the SDK ships both v1 and v2 entry points; production code
-  // should pin to v2.
-  const sdk = await import("@lightprotocol/stateless.js");
-  if (sdk.deriveAddressV2) {
-    const seed = sdk.deriveAddressSeedV2([NULLIFIER_PREFIX, nullifier]);
-    const address = sdk.deriveAddressV2(seed, addressTree, programId);
-    return { address, seed };
-  }
-  // Fallback for v1
-  const seed = sdk.deriveAddressSeed([NULLIFIER_PREFIX, nullifier]);
-  const address = sdk.deriveAddress(seed, addressTree, programId);
+async function deriveV2(seeds: Uint8Array[], addressTree: PublicKey, programId: PublicKey) {
+  const sdk: any = await import("@lightprotocol/stateless.js");
+  const seed = sdk.deriveAddressSeedV2(seeds);
+  const address = sdk.deriveAddressV2(seed, addressTree, programId);
   return { address, seed };
+}
+
+/** Address of the nullifier account (`[NULLIFIER_PREFIX, nullifier]`, v2 tree). */
+export function deriveNullifierAddress(programId: PublicKey, addressTree: PublicKey, nullifier: Bytes32) {
+  return deriveV2([NULLIFIER_PREFIX, nullifier], addressTree, programId);
+}
+
+/** Address of the attestation record (`[ATTESTATION_PREFIX, nullifier]`, v2 tree). */
+export function deriveAttestationAddress(programId: PublicKey, addressTree: PublicKey, nullifier: Bytes32) {
+  return deriveV2([ATTESTATION_PREFIX, nullifier], addressTree, programId);
 }

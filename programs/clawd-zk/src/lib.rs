@@ -39,307 +39,263 @@
 //!                       └────────────────┘      └──────────────┘
 //! ```
 //!
-//! ① Agent sends nullifiers + Groth16 proof + instruction data
-//! ② Agent supplies Groth16 proof as instruction arg (the verifier
-//!    re-derives the public inputs and checks the proof)
-//! ③ Program CPIs the Light System Program to update compressed state
+//! ① Agent sends the nullifier, a Groth16 proof and Borsh instruction data
+//! ② The program re-derives the public inputs (clawd-zk-core: two 128-bit
+//!    limbs per 32-byte value) and verifies the proof against a verifying
+//!    key pinned in `vk.rs` — callers cannot supply a key
+//! ③ Program CPIs the Light System Program (one validity proof per
+//!    instruction) to create/update compressed accounts
+
+#![allow(unexpected_cfgs)]
+#![allow(deprecated)]
 
 use anchor_lang::prelude::*;
+use light_sdk::{
+    account::LightAccount,
+    address::v2::derive_address,
+    cpi::{v2::CpiAccounts, v2::LightSystemProgramCpi, InvokeLightSystemProgram, LightCpiInstruction},
+    derive_light_cpi_signer,
+    instruction::{account_meta::CompressedAccountMeta, PackedAddressTreeInfo, ValidityProof},
+};
+use light_sdk_types::CpiSigner;
 
-pub mod nullifier;
-pub mod proof;
 pub mod state;
+pub mod verify;
+pub mod vk;
 
-use proof::verify_groth16;
+use state::{AttestationAccount, EncryptedStateAccount, NullifierAccount};
+use verify::{verify_pinned, Groth16Proof};
 
-declare_id!("CLAWDzk11111111111111111111111111111111111");
+// Matches the ID the client and agent already use. Not deployed anywhere
+// (checked devnet + mainnet 2026-11-26); deploying needs its keypair or
+// `anchor keys sync` with a new one.
+declare_id!("4vJ9JU1bJJE96FWSVKmnrL3xFU5jSBSVdk9x4La2vzhn");
 
-/// Light CPI signer (auto-derived from this program's ID by the Light SDK).
-/// Set at IDL-build time via `anchor idl build`. Placeholder for the scaffold.
-pub const LIGHT_CPI_SIGNER: Pubkey = Pubkey::new_from_array([
-    0x9C, 0x9C, 0x5A, 0xCB, 0x9F, 0x88, 0xC0, 0xA5,
-    0xE2, 0xD0, 0xBC, 0xB4, 0x42, 0xD6, 0xC3, 0x70,
-    0x42, 0xC2, 0xCC, 0x1F, 0x2D, 0x18, 0x9D, 0x6E,
-    0x29, 0x68, 0x9B, 0xC3, 0xA7, 0xE1, 0x3D, 0xB5,
-]);
+pub const LIGHT_CPI_SIGNER: CpiSigner =
+    derive_light_cpi_signer!("4vJ9JU1bJJE96FWSVKmnrL3xFU5jSBSVdk9x4La2vzhn");
 
 #[program]
 pub mod clawd_zk {
     use super::*;
 
-    /// Publish a new model attestation. Creates a nullifier to mark this
-    /// attestation as published exactly once, and writes an attestation
-    /// record (compressed) with the model hash, attester pubkey, and
-    /// an optional encrypted payload commitment.
-    ///
-    /// Requires a Groth16 proof that the attester is authorized to publish
-    /// for this model. The proof's public inputs must include the
-    /// (model_hash, nullifier) pair so they cannot be relabeled.
+    /// Publish a model attestation exactly once. Creates (atomically, in
+    /// one Light CPI) a nullifier account at `[NULLIFIER_SEED, nullifier]`
+    /// and the attestation record at `[ATTESTATION_SEED, nullifier]`.
+    /// Re-using the nullifier fails because the address already exists.
     pub fn publish_attestation<'info>(
-        ctx: Context<'_, '_, '_, 'info, PublishAttestationAccounts<'info>>,
-        data: PublishAttestationData,
-        nullifiers: Vec<[u8; 32]>,
+        ctx: Context<'_, '_, '_, 'info, SignerAccounts<'info>>,
+        proof: ValidityProof,
+        address_tree_info: PackedAddressTreeInfo,
+        output_state_tree_index: u8,
+        system_accounts_offset: u8,
+        args: PublishArgs,
     ) -> Result<()> {
-        // 1. Verify the Groth16 proof. The proof attests that the
-        //    attester knows a valid private key for `model_hash` and
-        //    that `nullifier` is the correct deterministic derivation.
-        let public_inputs = build_public_inputs(
-            &ctx.accounts.attester.key(),
-            &data.model_hash,
-            &data.payload_commitment,
-            &nullifiers,
+        let attester = ctx.accounts.signer.key();
+        let inputs = clawd_zk_core::publish_public_inputs(
+            &attester.to_bytes(),
+            &args.model_hash,
+            &args.payload_commitment,
+            &args.nullifier,
         );
-        verify_groth16(
-            &data.proof_a,
-            &data.proof_b,
-            &data.proof_c,
-            &public_inputs,
-            &data.verifying_key,
-        )
-        .map_err(|_| error!(ClawdZkError::InvalidProof))?;
+        verify_pinned(vk::PUBLISH_VK, &args.groth16, &inputs)?;
 
-        // 2. Create the nullifier compressed accounts via Light CPI.
-        nullifier::create_nullifiers(
-            &nullifiers,
-            data.nullifier_data,
-            ctx.accounts.attester.as_ref(),
-            ctx.remaining_accounts,
-        )?;
+        let cpi_accounts = light_cpi_accounts(ctx.accounts.signer.as_ref(), ctx.remaining_accounts, system_accounts_offset)?;
+        let tree = address_tree(&address_tree_info, &cpi_accounts)?;
 
-        // 3. Write the attestation record (compressed) with the metadata.
-        //    Implemented as a separate CPI to keep the nullifier logic
-        //    isolated and testable.
-        state::write_attestation(
-            &data.model_hash,
-            &data.payload_commitment,
-            &ctx.accounts.attester.key(),
-            data.state_data,
-            ctx.accounts.attester.as_ref(),
-            ctx.remaining_accounts,
-        )?;
+        let (nullifier_address, nullifier_seed) =
+            derive_address(&[state::NULLIFIER_SEED, &args.nullifier], &tree, &crate::ID);
+        let (record_address, record_seed) =
+            derive_address(&[state::ATTESTATION_SEED, &args.nullifier], &tree, &crate::ID);
 
-        msg!(
-            "Clawd ZK: published attestation for model {} by {} (nullifier root: {:?})",
-            hex::encode(&data.model_hash[..8]),
-            ctx.accounts.attester.key(),
-            &nullifiers[0][..8]
+        let nullifier_account = LightAccount::<NullifierAccount>::new_init(
+            &crate::ID,
+            Some(nullifier_address),
+            output_state_tree_index,
         );
+        let mut record = LightAccount::<AttestationAccount>::new_init(
+            &crate::ID,
+            Some(record_address),
+            output_state_tree_index,
+        );
+        *record = AttestationAccount {
+            model_hash: args.model_hash,
+            attester,
+            payload_commitment: args.payload_commitment,
+            nullifier: args.nullifier,
+            allowed_consumer: args.allowed_consumer,
+            published_at: Clock::get()?.unix_timestamp,
+            status: state::STATUS_ACTIVE,
+            consumed_by: Pubkey::default(),
+            consume_nonce: [0u8; 32],
+        };
+
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(nullifier_account)?
+            .with_light_account(record)?
+            .with_new_addresses(&[
+                address_tree_info.into_new_address_params_assigned_packed(nullifier_seed, Some(0)),
+                address_tree_info.into_new_address_params_assigned_packed(record_seed, Some(1)),
+            ])
+            .invoke(cpi_accounts)?;
+
+        msg!("clawd-zk: published attestation by {}", attester);
         Ok(())
     }
 
-    /// Verify an existing attestation and update its status (e.g. mark
-    /// as "consumed" by a downstream consumer). Does not create a new
-    /// nullifier — it consumes the attestation record's compressed slot.
+    /// Consume an attestation once. The client passes the current record;
+    /// the program validates it (active, nonce, allowed consumer), checks
+    /// the consume proof, and writes the consumed record. Light's validity
+    /// proof binds `record` to the existing leaf, and spending that leaf
+    /// makes a second consume of the same state impossible.
     pub fn consume_attestation<'info>(
-        ctx: Context<'_, '_, '_, 'info, ConsumeAttestationAccounts<'info>>,
-        data: ConsumeAttestationData,
+        ctx: Context<'_, '_, '_, 'info, SignerAccounts<'info>>,
+        proof: ValidityProof,
+        account_meta: CompressedAccountMeta,
+        system_accounts_offset: u8,
+        record: AttestationAccount,
+        consume_nonce: [u8; 32],
+        groth16: Groth16Proof,
     ) -> Result<()> {
-        // Verify a Groth16 proof that the consumer is allowed to consume
-        // this attestation (e.g. they own the downstream license).
-        let public_inputs = build_consume_public_inputs(
-            &ctx.accounts.consumer.key(),
-            &data.attestation_address,
-            &data.consume_nonce,
-        );
-        verify_groth16(
-            &data.proof_a,
-            &data.proof_b,
-            &data.proof_c,
-            &public_inputs,
-            &data.verifying_key,
-        )
-        .map_err(|_| error!(ClawdZkError::InvalidProof))?;
+        let consumer = ctx.accounts.signer.key();
+        state::validate_consume(&record, &consumer, &consume_nonce)?;
 
-        state::consume_attestation(
-            &data.attestation_address,
-            &data.consume_nonce,
-            &ctx.accounts.consumer.key(),
-            data.state_data,
-            ctx.accounts.consumer.as_ref(),
-            ctx.remaining_accounts,
-        )?;
-
-        msg!(
-            "Clawd ZK: consumed attestation {} by {}",
-            hex::encode(&data.attestation_address[..8]),
-            ctx.accounts.consumer.key()
+        let inputs = clawd_zk_core::consume_public_inputs(
+            &consumer.to_bytes(),
+            &account_meta.address,
+            &consume_nonce,
         );
+        verify_pinned(vk::CONSUME_VK, &groth16, &inputs)?;
+
+        let cpi_accounts = light_cpi_accounts(ctx.accounts.signer.as_ref(), ctx.remaining_accounts, system_accounts_offset)?;
+        let mut account = LightAccount::<AttestationAccount>::new_mut(&crate::ID, &account_meta, record)?;
+        let updated = state::consumed((*account).clone(), &consumer, &consume_nonce);
+        *account = updated;
+
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(account)?
+            .invoke(cpi_accounts)?;
+
+        msg!("clawd-zk: attestation consumed by {}", consumer);
         Ok(())
     }
 
-    /// Commit encrypted model state (weights, gradients, etc.) to a
-    /// compressed account. The Groth16 proof attests that the committer
-    /// knows the plaintext (or has a valid license to publish it).
+    /// Commit an encrypted-state commitment. One record per
+    /// (model_hash, committer, version): the address is derived from all
+    /// three, so the same version cannot be committed twice.
     pub fn commit_encrypted_state<'info>(
-        ctx: Context<'_, '_, '_, 'info, CommitStateAccounts<'info>>,
-        data: CommitStateData,
+        ctx: Context<'_, '_, '_, 'info, SignerAccounts<'info>>,
+        proof: ValidityProof,
+        address_tree_info: PackedAddressTreeInfo,
+        output_state_tree_index: u8,
+        system_accounts_offset: u8,
+        args: CommitArgs,
     ) -> Result<()> {
-        let public_inputs = build_commit_public_inputs(
-            &ctx.accounts.committer.key(),
-            &data.model_hash,
-            &data.ciphertext_commitment,
-            data.state_version,
+        let committer = ctx.accounts.signer.key();
+        let inputs = clawd_zk_core::commit_public_inputs(
+            &committer.to_bytes(),
+            &args.model_hash,
+            &args.ciphertext_commitment,
+            args.state_version,
         );
-        verify_groth16(
-            &data.proof_a,
-            &data.proof_b,
-            &data.proof_c,
-            &public_inputs,
-            &data.verifying_key,
-        )
-        .map_err(|_| error!(ClawdZkError::InvalidProof))?;
+        verify_pinned(vk::COMMIT_VK, &args.groth16, &inputs)?;
 
-        state::commit_encrypted(
-            &data.model_hash,
-            &data.ciphertext_commitment,
-            data.state_version,
-            &ctx.accounts.committer.key(),
-            data.state_data,
-            ctx.accounts.committer.as_ref(),
-            ctx.remaining_accounts,
-        )?;
-
-        msg!(
-            "Clawd ZK: committed encrypted state for model {} (v{}, ciphertext root: {:?})",
-            hex::encode(&data.model_hash[..8]),
-            data.state_version,
-            &data.ciphertext_commitment[..8]
+        let cpi_accounts = light_cpi_accounts(ctx.accounts.signer.as_ref(), ctx.remaining_accounts, system_accounts_offset)?;
+        let tree = address_tree(&address_tree_info, &cpi_accounts)?;
+        let version = state::state_seed_version(args.state_version);
+        let (address, seed) = derive_address(
+            &[state::STATE_SEED, &args.model_hash, committer.as_ref(), &version],
+            &tree,
+            &crate::ID,
         );
+        let mut account = LightAccount::<EncryptedStateAccount>::new_init(
+            &crate::ID,
+            Some(address),
+            output_state_tree_index,
+        );
+        *account = EncryptedStateAccount {
+            model_hash: args.model_hash,
+            committer,
+            ciphertext_commitment: args.ciphertext_commitment,
+            version: args.state_version,
+            published_at: Clock::get()?.unix_timestamp,
+        };
+
+        LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, proof)
+            .with_light_account(account)?
+            .with_new_addresses(&[address_tree_info.into_new_address_params_assigned_packed(seed, Some(0))])
+            .invoke(cpi_accounts)?;
+
+        msg!("clawd-zk: committed encrypted state v{} by {}", args.state_version, committer);
         Ok(())
     }
 }
 
-// ============================================================================
-// Instruction accounts + data
-// ============================================================================
-
-#[derive(Accounts)]
-pub struct PublishAttestationAccounts<'info> {
-    #[account(mut)]
-    pub attester: Signer<'info>,
+fn light_cpi_accounts<'c, 'info>(
+    signer: &'c AccountInfo<'info>,
+    remaining_accounts: &'c [AccountInfo<'info>],
+    system_accounts_offset: u8,
+) -> Result<CpiAccounts<'c, 'info>> {
+    let rest = remaining_accounts
+        .get(system_accounts_offset as usize..)
+        .ok_or_else(|| error!(ClawdZkError::NotEnoughAccounts))?;
+    Ok(CpiAccounts::new(signer, rest, LIGHT_CPI_SIGNER))
 }
 
-#[derive(Accounts)]
-pub struct ConsumeAttestationAccounts<'info> {
-    #[account(mut)]
-    pub consumer: Signer<'info>,
+fn address_tree(info: &PackedAddressTreeInfo, cpi_accounts: &CpiAccounts) -> Result<Pubkey> {
+    let tree = info
+        .get_tree_pubkey(cpi_accounts)
+        .map_err(|_| error!(ClawdZkError::NotEnoughAccounts))?;
+    require!(
+        tree.to_bytes() == light_sdk::constants::ADDRESS_TREE_V2,
+        ClawdZkError::UnknownTree
+    );
+    Ok(tree)
 }
 
+// ============================================================================
+// Accounts + instruction data (Borsh via Anchor)
+// ============================================================================
+
 #[derive(Accounts)]
-pub struct CommitStateAccounts<'info> {
+pub struct SignerAccounts<'info> {
     #[account(mut)]
-    pub committer: Signer<'info>,
+    pub signer: Signer<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
-pub struct PublishAttestationData {
-    /// 32-byte hash of the model being attested to.
+pub struct PublishArgs {
     pub model_hash: [u8; 32],
-    /// 32-byte commitment to the encrypted attestation payload.
     pub payload_commitment: [u8; 32],
-    /// Groth16 proof point A (G1, 64 bytes after endianness fix).
-    pub proof_a: [u8; 64],
-    /// Groth16 proof point B (G2, 128 bytes).
-    pub proof_b: [u8; 128],
-    /// Groth16 proof point C (G1, 64 bytes).
-    pub proof_c: [u8; 64],
-    /// Groth16 verifying key (variable length; pinned at compile time
-    /// by the client's circuit).
-    pub verifying_key: Vec<u8>,
-    /// Light Protocol data for writing the compressed attestation record.
-    pub state_data: state::WriteStateData,
-    /// Light Protocol data for creating the nullifier compressed accounts.
-    pub nullifier_data: nullifier::NullifierInstructionData,
+    /// v1 nullifier (`clawd_zk_core::compute_nullifier`).
+    pub nullifier: [u8; 32],
+    /// `Pubkey::default()` = anyone may consume.
+    pub allowed_consumer: Pubkey,
+    pub groth16: Groth16Proof,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
-pub struct ConsumeAttestationData {
-    /// Compressed account address of the attestation being consumed.
-    pub attestation_address: [u8; 32],
-    /// Unique nonce for this consumption (prevents replay of the
-    /// consume-proof itself).
-    pub consume_nonce: [u8; 32],
-    pub proof_a: [u8; 64],
-    pub proof_b: [u8; 128],
-    pub proof_c: [u8; 64],
-    pub verifying_key: Vec<u8>,
-    pub state_data: state::ConsumeStateData,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
-pub struct CommitStateData {
+pub struct CommitArgs {
     pub model_hash: [u8; 32],
-    /// Commitment to the ciphertext (Poseidon hash of (ct, nonce)).
     pub ciphertext_commitment: [u8; 32],
-    /// Monotonically increasing version for the same model.
     pub state_version: u64,
-    pub proof_a: [u8; 64],
-    pub proof_b: [u8; 128],
-    pub proof_c: [u8; 64],
-    pub verifying_key: Vec<u8>,
-    pub state_data: state::WriteStateData,
+    pub groth16: Groth16Proof,
 }
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-fn build_public_inputs(
-    attester: &Pubkey,
-    model_hash: &[u8; 32],
-    payload_commitment: &[u8; 32],
-    nullifiers: &[[u8; 32]],
-) -> Vec<[u8; 32]> {
-    let mut out = Vec::with_capacity(3 + nullifiers.len());
-    out.push(*attester.to_bytes());
-    out.push(*model_hash);
-    out.push(*payload_commitment);
-    for n in nullifiers {
-        out.push(*n);
-    }
-    out
-}
-
-fn build_consume_public_inputs(
-    consumer: &Pubkey,
-    attestation_address: &[u8; 32],
-    consume_nonce: &[u8; 32],
-) -> Vec<[u8; 32]> {
-    vec![
-        *consumer.to_bytes(),
-        *attestation_address,
-        *consume_nonce,
-    ]
-}
-
-fn build_commit_public_inputs(
-    committer: &Pubkey,
-    model_hash: &[u8; 32],
-    ciphertext_commitment: &[u8; 32],
-    state_version: u64,
-) -> Vec<[u8; 32]> {
-    let mut version_bytes = [0u8; 32];
-    version_bytes[..8].copy_from_slice(&state_version.to_le_bytes());
-    vec![
-        *committer.to_bytes(),
-        *model_hash,
-        *ciphertext_commitment,
-        version_bytes,
-    ]
-}
-
-// ============================================================================
-// Errors
-// ============================================================================
 
 #[error_code]
+#[derive(PartialEq, Eq)]
 pub enum ClawdZkError {
-    #[msg("The Groth16 proof did not verify against the public inputs.")]
+    #[msg("The Groth16 proof did not verify against the pinned key and public inputs.")]
     InvalidProof,
-    #[msg("The provided public inputs are malformed or out of range.")]
-    InvalidPublicInputs,
-    #[msg("The compressed account already exists (nullifier collision).")]
-    NullifierAlreadyExists,
-    #[msg("The state tree / address tree pubkey is not a known Light Protocol tree.")]
+    #[msg("No verifying key is pinned for this instruction; it is disabled.")]
+    VerifyingKeyNotPinned,
+    #[msg("The address tree is not Light's v2 address tree.")]
     UnknownTree,
+    #[msg("Not enough remaining accounts for the Light CPI.")]
+    NotEnoughAccounts,
+    #[msg("The attestation is not active (already consumed or revoked).")]
+    AttestationNotActive,
+    #[msg("The consume nonce must be non-zero.")]
+    InvalidConsumeNonce,
+    #[msg("This attestation is restricted to a different consumer.")]
+    ConsumerNotAllowed,
 }

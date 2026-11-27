@@ -1,0 +1,4 @@
+# platform-tools v1.52 ships cargo/rustc 1.84: resolve dependencies to
+# versions that support it (no edition-2024 crates) so `cargo build-sbf` works.
+[resolver]
+incompatible-rust-versions = "fallback"

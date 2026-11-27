@@ -19,7 +19,7 @@
     "TERMINAL_URL": "https://cheshireterminal.ai",
     "ZK_AGENT_PACKAGE": "@clawd/zk-shark-agent",
     "ZK_CLIENT_PACKAGE": "@clawd/zk-client",
-    "ZK_PROGRAM_ID": "CLAWDzk11111111111111111111111111111111111"
+    "ZK_PROGRAM_ID": "4vJ9JU1bJJE96FWSVKmnrL3xFU5jSBSVdk9x4La2vzhn"
   },
   "trustGate": {
     "inspect": "observer",

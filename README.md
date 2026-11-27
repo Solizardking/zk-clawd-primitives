@@ -7,9 +7,19 @@
 
 ## Implementation status
 
-The on-chain flows below describe the intended design. The SDK currently encodes
-instruction data as JSON and the compressed-state handlers are incomplete.
-For an executable off-chain workflow, start with the
+Phase 1 (2026-11-26): the program builds for SBF (`cargo build-sbf`,
+Anchor 0.31.1 + light-sdk 0.17.1 + groth16-solana 0.3.1), Groth16 verifying
+keys are **pinned in the program** (callers can no longer supply one),
+instruction data is Borsh, and nullifiers / public inputs come from the
+shared `crates/clawd-zk-core` crate, whose encoding is proved in Lean 4
+(`formal/lean`) and cross-checked against Rust and TypeScript through
+`formal/vectors`.
+
+**Not deployable yet:** no production circuits exist, so every verifying-key
+slot in `programs/clawd-zk/src/vk.rs` is empty and all three instructions
+fail closed with `VerifyingKeyNotPinned`. The Light RPC wiring in the client
+has not been run against a Light test validator. For an executable
+off-chain workflow today, use the
 [Model Kit artifact handoff](docs/INTEGRATION.md#model-kit-artifact-handoff).
 
 ## What this is
@@ -43,60 +53,52 @@ The edge install and metadata handoff is documented in
 ## Repo layout
 
 ```
-zk-primitives/
-├── README.md                                ← you are here
-├── docs/
-│   ├── ARCHITECTURE.md                      ← deep dive: design, costs, security
-│   ├── INTEGRATION.md                       ← runtime catalog and trust gates
-│   └── EDGE_DISTRIBUTION.md                 ← Cloudflare metadata surface
-├── programs/
-│   └── clawd-zk/                           ← Anchor program
-│       ├── Cargo.toml
-│       ├── Xargo.toml
-│       └── src/
-│           ├── lib.rs                       ← program entry, instruction dispatch
-│           ├── nullifier.rs                 ← compressed-PDA nullifier logic
-│           ├── proof.rs                     ← Groth16 verifier wrapper
-│           └── state.rs                     ← compressed state writes / consumes
-├── client/                                  ← TypeScript SDK (@clawd/zk-client)
-│   ├── package.json
-│   ├── tsconfig.json
+zk-clawd-primitives/
+├── Cargo.toml                    ← Rust workspace (program + core)
+├── .cargo/config.toml            ← MSRV-aware resolver (platform-tools cargo 1.84)
+├── crates/clawd-zk-core/         ← pure no_std core shared by program and client spec:
+│                                    v1 nullifier encoding, split128 BN254 inputs
+├── programs/clawd-zk/            ← Anchor program
 │   └── src/
-│       ├── index.ts                         ← public exports
-│       ├── types.ts                         ← shared types
-│       ├── nullifier.ts                     ← nullifier computation
-│       ├── proof.ts                         ← public-input packing + proof serialization
-│       ├── state.ts                         ← Light Protocol helpers
-│       └── client.ts                        ← high-level ClawdZkClient
-├── tests/                                   ← integration tests
-│   ├── nullifier.test.ts                    ← vitest, off-chain pieces
-│   └── nullifier.rs                         ← cargo test-sbf, on-chain pieces
-└── configs/
-    └── light-trees.yaml                     ← canonical V2 tree pubkeys
+│       ├── lib.rs                ← instructions (publish / consume / commit)
+│       ├── state.rs              ← compressed records + pure consume validation
+│       ├── verify.rs             ← groth16-solana wrapper
+│       └── vk.rs                 ← pinned verifying keys (empty = fail closed)
+│   └── tests/                    ← groth16 (real proofs), consume rules, Borsh vectors
+├── client/                       ← TypeScript SDK (@clawd/zk-client)
+│   ├── src/encoding.ts           ← Borsh instruction encoders
+│   ├── src/nullifier.ts          ← v1 nullifier (mirrors clawd-zk-core)
+│   ├── src/proof.ts              ← split128 public inputs
+│   └── test/                     ← unit tests + cross-implementation vectors
+├── formal/
+│   ├── lean/                     ← Lean 4 proofs (injectivity, BN254 limb split)
+│   └── vectors/                  ← Lean/Rust-generated vectors all impls must match
+├── agent/                        ← ZK Shark agent CLI
+└── scripts/check-formal.sh       ← Lean → vectors → Rust → TS in one run
 ```
 
 ## The three instructions
 
 ```text
-publish_attestation(model_hash, payload_commitment, proof, nullifiers)
-   ├── Verifies Groth16(attester, model_hash, payload_commitment, nullifiers)
-   ├── CPI → Light System Program
-   │   ├── Create nullifier compressed PDA at derived address
-   │   └── Write AttestationAccount (compressed state)
-   └── Emits: tx log, ~25,000 lamports, ~618k CU
+publish_attestation(validity_proof, address_tree_info, output_tree, offset,
+                    {model_hash, payload_commitment, nullifier, allowed_consumer, groth16})
+   ├── Groth16 vs PUBLISH_VK over split128(attester, model_hash, payload_commitment, nullifier)
+   └── one Light CPI: create nullifier account [clawd-zk-nullifier, nullifier]
+                      + AttestationAccount   [clawd-zk-attest, nullifier]
 
-consume_attestation(attestation_address, consume_nonce, proof)
-   ├── Verifies Groth16(consumer, attestation_address, consume_nonce)
-   ├── CPI → Light System Program
-   │   └── Read+modify AttestationAccount (status 0→1)
-   └── Emits: tx log, ~5,000 lamports, ~310k CU
+consume_attestation(validity_proof, account_meta, offset, record, consume_nonce, groth16)
+   ├── validate record: active, nonce ≠ 0, consumer == allowed_consumer (if set)
+   ├── Groth16 vs CONSUME_VK over split128(consumer, record address, consume_nonce)
+   └── Light CPI: spend the current record (validity proof binds `record` to the
+       leaf), write it back with status=consumed, consumed_by, consume_nonce
 
-commit_encrypted_state(model_hash, ciphertext_commitment, version, proof)
-   ├── Verifies Groth16(committer, model_hash, ciphertext_commitment, version)
-   ├── CPI → Light System Program
-   │   └── Write EncryptedStateAccount (compressed state)
-   └── Emits: tx log, ~5,300 lamports, ~410k CU
+commit_encrypted_state(validity_proof, address_tree_info, output_tree, offset,
+                       {model_hash, ciphertext_commitment, state_version, groth16})
+   ├── Groth16 vs COMMIT_VK over split128(committer, model_hash, commitment) ‖ version
+   └── Light CPI: create EncryptedStateAccount [clawd-zk-state, model, committer, version]
 ```
+
+Proof bytes use groth16-solana's layout (uncompressed, big-endian, `a` = −A).
 
 ## Quick start
 
@@ -135,7 +137,7 @@ const ix = await client.publishAttestation({
   modelHash: hexToBytes("ab12..."),
   payloadCommitment: hexToBytes("cd34..."),
   nullifier,
-  proof: { a: proofA, b: proofB, c: proofC, verifyingKey },
+  proof: { a: negA, b, c }, // no verifying key: the program pins it
 });
 
 // 3. Send.
@@ -146,16 +148,11 @@ console.log("attestation published:", sig);
 ### Test
 
 ```bash
-# Off-chain tests (vitest)
-cd client
-pnpm test
-
-# On-chain tests (cargo test-sbf)
-cd programs/clawd-zk
-# In another terminal, first run:
-#   light test-validator
-# Then:
-cargo test-sbf
+./scripts/check-formal.sh        # Lean proofs + vectors + all Rust + client tests
+cargo test --workspace           # Rust only
+(cd programs/clawd-zk && cargo build-sbf)
+(cd client && npx vitest run)
+(cd client && npx tsc -p . && cd ../agent && npx vitest run)   # agent needs client/dist
 ```
 
 ## Why this matters for the Clawd stack
@@ -193,21 +190,20 @@ to discover local source through `CLAWDBOT_ZK_PRIMITIVES_DIR` and
 
 ## Status
 
-**Scaffold**: All modules compile-check, all tests are written and
-parse, the SDK structure mirrors the reference `nullifier_creation`
-crate from Light Protocol. Production deployment requires:
+Done in Phase 1: SBF build, pinned-VK verification, shared core, Borsh
+client, real consume validation, real tests (Groth16 proofs generated and
+verified on the host, Borsh golden vectors shared with the TS client, Lean
+vectors shared by Lean, Rust and TS).
 
-1. Generate the canonical `LIGHT_CPI_SIGNER` via `anchor idl build`.
-2. Set up a per-circuit Powers-of-Tau ceremony for the Groth16 VK.
-3. Run `light test-validator` + `cargo test-sbf` against a deployed
-   V2 mainnet/devnet tree set.
-4. Wire the `Borsh` encoding layer (replace the JSON-encode shim
-   in `client.ts` with proper `BorshInstructionCoder` from
-   `@coral-xyz/anchor`).
+Still required before any deployment:
 
-The architecture is designed to be reviewable: the on-chain program
-is < 400 lines of Rust across 4 files, and the off-chain SDK is
-< 300 lines of TypeScript across 5 files.
+1. Write the three circuits (publish: knowledge of the nullifier secret;
+   consume: consumer authorization; commit: plaintext knowledge), run a
+   real multi-party setup, and pin the keys in `vk.rs`.
+2. Integration tests on `light test-validator` / `light-program-test`
+   (needs the Light prover server) for the CPI paths.
+3. A program keypair for `4vJ9JU1b…` (or `anchor keys sync` to a new ID)
+   and an explicit deploy decision.
 
 ## Historical Lineage
 

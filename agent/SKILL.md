@@ -101,8 +101,7 @@ The proof JSON shape is:
 {
   "a": "0x...",
   "b": "0x...",
-  "c": "0x...",
-  "verifyingKey": "0x..."
+  "c": "0x..."
 }
 ```
 

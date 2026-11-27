@@ -15,7 +15,7 @@ Built on [Light Protocol V2](https://www.zkcompression.com) for rent-free compre
 | Consume attestation (one-shot) | `consume_attestation` | ~310k CU, ~5k lamports |
 | Encrypted state commitment | `commit_encrypted_state` | ~410k CU, ~5.3k lamports |
 
-Program ID: `CLAWDzk11111111111111111111111111111111111`
+Program ID: `4vJ9JU1bJJE96FWSVKmnrL3xFU5jSBSVdk9x4La2vzhn`
 
 ---
 
@@ -120,14 +120,14 @@ let (address, seed) = derive_address(
 {
   "a": "0x...",          // 64 bytes — G1 point (big-endian wire)
   "b": "0x...",          // 128 bytes — G2 point (big-endian wire)
-  "c": "0x...",          // 64 bytes — G1 point (big-endian wire)
-  "verifyingKey": "0x..." // variable — serialized VK (alt-bn128)
+  "c": "0x..."           // 64 bytes — G1 point (big-endian wire)
 }
 ```
 
-The on-chain verifier swaps `proof_a` endianness (big-endian → little-endian).
-`proof_b` and `proof_c` stay big-endian.
-VK is supplied as instruction data — enables per-circuit support without program upgrades.
+groth16-solana layout: everything big-endian, and `a` must already be
+negated (−A). The verifying key is pinned in the program per instruction
+(`programs/clawd-zk/src/vk.rs`) and is never sent; a `verifyingKey` field
+in a proof file is rejected by the agent.
 
 ---
 
@@ -174,7 +174,7 @@ import { createSolanaRpc } from "@solana/kit";
 const rpc    = createSolanaRpc("https://mainnet.helius-rpc.com/?api-key=...");
 const client = new ClawdZkClient({
   rpc,
-  programId: new PublicKey("CLAWDzk11111111111111111111111111111111111"),
+  programId: new PublicKey("4vJ9JU1bJJE96FWSVKmnrL3xFU5jSBSVdk9x4La2vzhn"),
   photonUrl: "https://mainnet.helius-rpc.com/?api-key=...",
 });
 
@@ -183,7 +183,7 @@ const ix = await client.publishAttestation({
   modelHash:         modelHashBytes,
   payloadCommitment: payloadCommitmentBytes,
   nullifier,
-  proof: groth16Proof,  // { a, b, c, verifyingKey }
+  proof: groth16Proof,  // { a, b, c } — verifying key is pinned on-chain
 });
 // → TransactionInstruction — sign and send normally
 ```
@@ -400,8 +400,8 @@ proofs, signer material, or transaction submission authority.
 - [ ] Run Powers-of-Tau ceremony for the specific circuit
 - [ ] Generate canonical `LIGHT_CPI_SIGNER` via `anchor idl build`
 - [ ] Deploy with `anchor deploy --provider.cluster mainnet`
-- [ ] Register VK as program constant or well-known config
-- [ ] Replace JSON shim in `client.ts` with `@coral-xyz/anchor` BorshInstructionCoder
+- [x] Register VK as program constant (slots in `vk.rs`; empty until circuits exist)
+- [x] Replace JSON shim in `client.ts` with Borsh encoding (`client/src/encoding.ts`, golden vectors)
 - [ ] Wire `sendAndConfirm` from `@solana/kit` in `agent.ts` `trySend` hook
 - [ ] Run `cargo test-sbf` against a real `light test-validator`
 

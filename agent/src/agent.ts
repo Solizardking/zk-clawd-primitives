@@ -18,7 +18,7 @@
  * const { signature, nullifier } = await agent.attestModel({
  *   modelHash: ...,
  *   payloadCommitment: ...,
- *   proof: { a, b, c, verifyingKey },
+ *   proof: { a, b, c }, // groth16-solana layout; the program pins the verifying key
  *   context: "model-attest:v1:my-model",
  * });
  * ```
@@ -154,11 +154,15 @@ async function loadProofFromFile(path: string): Promise<Groth16Proof> {
     c: string;
     verifyingKey?: string;
   };
+  if (json.verifyingKey !== undefined) {
+    throw new Error(
+      "proof.json must not contain verifyingKey: clawd-zk pins its verifying keys on-chain and ignores caller keys.",
+    );
+  }
   return {
     a: hexToBytes(json.a),
     b: hexToBytes(json.b),
     c: hexToBytes(json.c),
-    verifyingKey: json.verifyingKey ? hexToBytes(json.verifyingKey) : new Uint8Array(0),
   };
 }
 
@@ -205,7 +209,7 @@ export class ZkSharkAgent {
    * Convenience: load a proof JSON file from disk and return it as a
    * `Groth16Proof` with hex → bytes conversion.
    *
-   * Expected shape: `{ a: "0x...", b: "0x...", c: "0x...", verifyingKey: "0x..." }`.
+   * Expected shape: `{ a: "0x...", b: "0x...", c: "0x..." }` (groth16-solana layout, `a` = −A).
    */
   static async loadProof(path: string): Promise<Groth16Proof> {
     return loadProofFromFile(path);

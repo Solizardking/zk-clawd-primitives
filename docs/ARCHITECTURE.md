@@ -149,23 +149,25 @@ is the "one-shot" property: the nullifier can be created exactly once.
 
 ### 4.2 Groth16 verification
 
-We use `light-verifier` (the same crate Light Protocol uses
-internally for its validity proofs). The wire format:
+We use `groth16-solana` 0.3.1 (alt_bn128 syscalls on-chain, arkworks on
+the host). Wire format (groth16-solana layout, all big-endian):
 
-- `proof_a`: 64 bytes (G1, big-endian)
-- `proof_b`: 128 bytes (G2, big-endian)
-- `proof_c`: 64 bytes (G1, big-endian)
-- `verifying_key`: variable length — `[G1 alpha; G2 beta; G1 gamma;
-  G1 delta; G1[N+1] gamma_abc]` (alt-bn128)
+- `a`: 64 bytes (G1, **negated**: −A)
+- `b`: 128 bytes (G2)
+- `c`: 64 bytes (G1)
 
-The verifier:
-1. Swaps endianness on each G1 element (BN254 uses big-endian
-   field elements; Solana Groth16 libs use little-endian).
-2. Initializes `Groth16Verifier` with the proof points, public inputs,
-   and VK.
-3. Calls `verify()` which runs the pairing check.
+The verifying key is **not** instruction data. Each instruction has a
+pinned key slot in `programs/clawd-zk/src/vk.rs`; an empty slot makes the
+instruction fail closed (`VerifyingKeyNotPinned`). Accepting a caller's key
+would let anyone verify a proof for a circuit of their own choosing.
 
-Cost: ~200,000 CU per verification (Light Protocol benchmarks).
+Public inputs come from `clawd-zk-core`: each 32-byte value is split into
+two 128-bit limbs so every input is a canonical BN254 scalar (raw pubkeys
+and hashes are ≥ r about 81% of the time). Publish has 8 inputs, consume
+6, commit 7 (the version is one scalar).
+
+Cost: roughly 200k CU per verification (groth16-solana benchmarks; not
+yet measured for these circuits).
 
 ### 4.3 Compressed state
 

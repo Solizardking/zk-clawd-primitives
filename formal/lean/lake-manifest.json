@@ -1,0 +1,6 @@
+{"version": "1.3.0",
+ "packagesDir": ".lake/packages",
+ "packages": [],
+ "name": "clawd_zk",
+ "lakeDir": ".lake",
+ "fixedToolchain": false}

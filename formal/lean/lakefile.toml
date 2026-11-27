@@ -1,0 +1,10 @@
+name = "clawd_zk"
+version = "0.1.0"
+defaultTargets = ["ClawdZk", "vectors"]
+
+[[lean_lib]]
+name = "ClawdZk"
+
+[[lean_exe]]
+name = "vectors"
+root = "Vectors"

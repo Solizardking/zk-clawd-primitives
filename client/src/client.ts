@@ -1,35 +1,47 @@
 /**
- * ClawdZkClient — high-level orchestrator.
+ * ClawdZkClient — builds ready-to-sign `clawd-zk` instructions.
  *
- * Glues together nullifier computation, Groth16 proof assembly, and
- * Light Protocol validity-proof fetching into single-method calls
- * that produce ready-to-sign Solana instructions.
+ * Instruction data is Borsh (see `encoding.ts`), not JSON. The Groth16
+ * verifying key is pinned in the program and is never sent.
+ *
+ * NOTE: the Photon/Light RPC wiring (`state.ts`) is not yet exercised
+ * against a Light test validator; the byte encodings are (golden vectors).
  */
 
 import { PublicKey, TransactionInstruction } from "@solana/web3.js";
+import type { ClawdZkClientConfig, CommitStateArgs, PublishAttestationArgs, Groth16Proof } from "./types.js";
+import { serializeProof } from "./proof.js";
+import { fetchAddressTreeV2, fetchRandomStateTreeV2, fetchValidityProofV2, packAccounts, type ValidityProof } from "./state.js";
+import { deriveAttestationAddress, deriveNullifierAddress, STATE_PREFIX } from "./nullifier.js";
 import {
-  ClawdZkClientConfig,
-  CommitStateArgs,
-  PublishAttestationArgs,
-  Groth16Proof,
-} from "./types.js";
-import {
-  buildCommitPublicInputs,
-  buildPublishPublicInputs,
-  packPublicInputs,
-  serializeProof,
-} from "./proof.js";
-import {
-  fetchAddressTreeV2,
-  fetchRandomStateTreeV2,
-  fetchValidityProofV2,
-  packAccounts,
-} from "./state.js";
-import { computeNullifier, deriveNullifierAddress } from "./nullifier.js";
+  encodeCommitEncryptedState,
+  encodeConsumeAttestation,
+  encodePublishAttestation,
+  type AttestationRecord,
+  type CompressedAccountMetaArgs,
+  type LightValidityProof,
+} from "./encoding.js";
 
-const PROGRAM_IDENTITY: PublicKey = new PublicKey(
-  "4vJ9JU1bJJE96FWSVKmnrL3xFU5jSBSVdk9x4La2vzhn",
-);
+/** Default program ID — matches `declare_id!` in programs/clawd-zk. Not deployed yet. */
+export const CLAWD_ZK_PROGRAM_ID = new PublicKey("4vJ9JU1bJJE96FWSVKmnrL3xFU5jSBSVdk9x4La2vzhn");
+
+const ZERO32 = new Uint8Array(32);
+
+export interface ConsumeAttestationArgs {
+  signer: PublicKey;
+  /** Current record, as returned by Photon for the attestation address. */
+  record: AttestationRecord;
+  /** Packed account meta for the record (tree info, address, output tree). */
+  accountMeta: CompressedAccountMetaArgs;
+  /** Light validity proof (inclusion of the current record). */
+  validityProof: LightValidityProof;
+  /** Packed remaining accounts (Light system accounts + trees). */
+  remainingAccounts: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[];
+  systemAccountsOffset: number;
+  /** Non-zero 32-byte nonce bound into the consume proof. */
+  consumeNonce: Uint8Array;
+  proof: Groth16Proof;
+}
 
 export class ClawdZkClient {
   readonly rpc: any;
@@ -40,205 +52,134 @@ export class ClawdZkClient {
 
   constructor(config: ClawdZkClientConfig) {
     this.rpc = config.rpc;
-    this.programId = config.programId ?? PROGRAM_IDENTITY;
+    this.programId = config.programId ?? CLAWD_ZK_PROGRAM_ID;
     this.photonUrl = config.photonUrl ?? "";
     this.apiKey = config.apiKey;
     this.commitment = config.commitment ?? "confirmed";
   }
 
-  /**
-   * Build a `publish_attestation` instruction. The caller must supply
-   * the Groth16 proof (already generated off-chain). This method does
-   * the rest: derives the nullifier address, fetches the validity
-   * proof, packs the system accounts.
-   */
+  /** `publish_attestation`: creates the nullifier and the record in one Light CPI. */
   async publishAttestation(args: PublishAttestationArgs): Promise<TransactionInstruction> {
-    // 1. Sanity-check and serialize the proof.
-    const proof = serializeProof(args.proof);
-
-    // 2. Derive the nullifier's compressed-account address.
+    const groth16 = serializeProof(args.proof);
     const addressTree = await fetchAddressTreeV2(this.rpc);
-    const { address: nullifierAddress } = await deriveNullifierAddress(
-      this.programId,
-      addressTree,
-      args.nullifier,
-    );
+    const { address: nullifierAddress } = await deriveNullifierAddress(this.programId, addressTree, args.nullifier);
+    const { address: recordAddress } = await deriveAttestationAddress(this.programId, addressTree, args.nullifier);
 
-    // 3. Fetch a validity proof (proves the nullifier address does not exist).
     const validity = await fetchValidityProofV2({
       rpc: this.rpc,
       hashes: [],
-      addressesWithTrees: [{ address: nullifierAddress, tree: addressTree }],
-    });
-
-    // 4. Fetch a random state tree for the new output.
-    const stateTree = await fetchRandomStateTreeV2(this.rpc);
-
-    // 5. Pack system accounts.
-    const { packed, addressMerkleTreeIndex, outputStateTreeIndex } =
-      await packAccounts({
-        rpc: this.rpc,
-        programId: this.programId,
-        treeInfo: {
-          addressTree,
-          stateTree: stateTree.tree,
-          outputQueue: stateTree.queue,
-        },
-        proof: validity,
-      });
-
-    const systemStart = 0; // convention: system accounts are first in remaining
-    const systemAccountsOffset = systemStart;
-
-    // 6. Build the canonical public input vector.
-    const publicInputs = buildPublishPublicInputs({
-      attester: args.signer.toBytes(),
-      modelHash: args.modelHash,
-      payloadCommitment: args.payloadCommitment,
-      nullifier: args.nullifier,
-    });
-
-    // 7. Serialize the on-chain instruction data.
-    const data = {
-      modelHash: [...args.modelHash],
-      payloadCommitment: [...args.payloadCommitment],
-      proofA: [...proof.proofA],
-      proofB: [...proof.proofB],
-      proofC: [...proof.proofC],
-      verifyingKey: [...proof.verifyingKey],
-      publicInputsPacked: [...packPublicInputs(publicInputs)],
-      stateData: {
-        proof: { 0: validity.compressedProof },
-        stateTreeInfo: {
-          stateMerkleTreePubkeyIndex: outputStateTreeIndex,
-          outputQueuePubkeyIndex: outputStateTreeIndex,
-          rootIndex: validity.rootIndices[0] ?? 0,
-        },
-        outputStateTreeIndex,
-        systemAccountsOffset,
-      },
-      nullifierData: {
-        proof: { 0: validity.compressedProof },
-        addressTreeInfo: {
-          addressMerkleTreePubkeyIndex: addressMerkleTreeIndex,
-          addressQueuePubkeyIndex: addressMerkleTreeIndex,
-          rootIndex: validity.rootIndices[0] ?? 0,
-        },
-        outputStateTreeIndex,
-        systemAccountsOffset,
-      },
-    };
-
-    // 8. Encode the discriminator for `publish_attestation` (Anchor IDL).
-    const discriminator = sha256("global:publish_attestation").slice(0, 8);
-
-    const ix = new TransactionInstruction({
-      programId: this.programId,
-      keys: [
-        { pubkey: args.signer, isSigner: true, isWritable: true },
-        ...toRemainingAccountMetas(packed),
+      addressesWithTrees: [
+        { address: nullifierAddress, tree: addressTree },
+        { address: recordAddress, tree: addressTree },
       ],
-      data: encodeInstructionData(discriminator, data),
     });
-
-    return ix;
-  }
-
-  /**
-   * Build a `commit_encrypted_state` instruction. The off-chain
-   * committer must supply a Groth16 proof that they know the
-   * plaintext (or have a valid license).
-   */
-  async commitEncryptedState(args: CommitStateArgs): Promise<TransactionInstruction> {
-    const proof = serializeProof(args.proof);
     const stateTree = await fetchRandomStateTreeV2(this.rpc);
-
-    // Validity proof for a write (no address creation).
-    const validity = await fetchValidityProofV2({
-      rpc: this.rpc,
-      hashes: [],
-      addressesWithTrees: [],
-    });
-
-    const { packed, outputStateTreeIndex } = await packAccounts({
+    const { packed, addressMerkleTreeIndex, outputStateTreeIndex } = await packAccounts({
       rpc: this.rpc,
       programId: this.programId,
-      treeInfo: {
-        addressTree: stateTree.tree, // dummy; not used for write-without-address
-        stateTree: stateTree.tree,
-        outputQueue: stateTree.queue,
-      },
+      treeInfo: { addressTree, stateTree: stateTree.tree, outputQueue: stateTree.queue },
       proof: validity,
     });
+    const { remainingAccounts, systemStart } = packed.toAccountMetas();
 
-    const publicInputs = buildCommitPublicInputs({
-      committer: args.signer.toBytes(),
-      modelHash: args.modelHash,
-      ciphertextCommitment: args.ciphertextCommitment,
-      stateVersion: args.stateVersion,
-    });
-
-    const data = {
-      modelHash: [...args.modelHash],
-      ciphertextCommitment: [...args.ciphertextCommitment],
-      stateVersion: typeof args.stateVersion === "bigint"
-        ? Number(args.stateVersion)
-        : args.stateVersion,
-      proofA: [...proof.proofA],
-      proofB: [...proof.proofB],
-      proofC: [...proof.proofC],
-      verifyingKey: [...proof.verifyingKey],
-      publicInputsPacked: [...packPublicInputs(publicInputs)],
-      stateData: {
-        proof: { 0: validity.compressedProof },
-        stateTreeInfo: {
-          stateMerkleTreePubkeyIndex: outputStateTreeIndex,
-          outputQueuePubkeyIndex: outputStateTreeIndex,
-          rootIndex: validity.rootIndices[0] ?? 0,
-        },
-        outputStateTreeIndex,
-        systemAccountsOffset: 0,
+    const data = encodePublishAttestation({
+      proof: toLightProof(validity),
+      addressTreeInfo: {
+        addressMerkleTreePubkeyIndex: addressMerkleTreeIndex,
+        addressQueuePubkeyIndex: addressMerkleTreeIndex,
+        rootIndex: validity.rootIndices[0] ?? 0,
       },
-    };
+      outputStateTreeIndex,
+      systemAccountsOffset: systemStart,
+      args: {
+        modelHash: args.modelHash,
+        payloadCommitment: args.payloadCommitment,
+        nullifier: args.nullifier,
+        allowedConsumer: args.allowedConsumer?.toBytes() ?? ZERO32,
+        groth16,
+      },
+    });
+    return this.ix(args.signer, remainingAccounts, data);
+  }
 
-    const discriminator = sha256("global:commit_encrypted_state").slice(0, 8);
+  /**
+   * `consume_attestation`: lower-level — the caller supplies the record and
+   * its packed meta/validity proof from Photon (`getCompressedAccount` +
+   * `getValidityProofV0` over the record hash).
+   */
+  consumeAttestation(args: ConsumeAttestationArgs): TransactionInstruction {
+    if (args.consumeNonce.length !== 32 || args.consumeNonce.every((b) => b === 0)) {
+      throw new Error("consumeNonce must be 32 non-zero bytes");
+    }
+    if (args.record.status !== 0) throw new Error("attestation is not active");
+    const data = encodeConsumeAttestation({
+      proof: args.validityProof,
+      accountMeta: args.accountMeta,
+      systemAccountsOffset: args.systemAccountsOffset,
+      record: args.record,
+      consumeNonce: args.consumeNonce,
+      groth16: serializeProof(args.proof),
+    });
+    return this.ix(args.signer, args.remainingAccounts, data);
+  }
+
+  /** `commit_encrypted_state`: one record per (model, committer, version). */
+  async commitEncryptedState(args: CommitStateArgs): Promise<TransactionInstruction> {
+    const groth16 = serializeProof(args.proof);
+    const addressTree = await fetchAddressTreeV2(this.rpc);
+    const version = new Uint8Array(8);
+    new DataView(version.buffer).setBigUint64(0, BigInt(args.stateVersion), true);
+    const sdk: any = await import("@lightprotocol/stateless.js");
+    const seed = sdk.deriveAddressSeedV2([STATE_PREFIX, args.modelHash, args.signer.toBytes(), version]);
+    const address = sdk.deriveAddressV2(seed, addressTree, this.programId);
+
+    const validity = await fetchValidityProofV2({
+      rpc: this.rpc,
+      hashes: [],
+      addressesWithTrees: [{ address, tree: addressTree }],
+    });
+    const stateTree = await fetchRandomStateTreeV2(this.rpc);
+    const { packed, addressMerkleTreeIndex, outputStateTreeIndex } = await packAccounts({
+      rpc: this.rpc,
+      programId: this.programId,
+      treeInfo: { addressTree, stateTree: stateTree.tree, outputQueue: stateTree.queue },
+      proof: validity,
+    });
+    const { remainingAccounts, systemStart } = packed.toAccountMetas();
+
+    const data = encodeCommitEncryptedState({
+      proof: toLightProof(validity),
+      addressTreeInfo: {
+        addressMerkleTreePubkeyIndex: addressMerkleTreeIndex,
+        addressQueuePubkeyIndex: addressMerkleTreeIndex,
+        rootIndex: validity.rootIndices[0] ?? 0,
+      },
+      outputStateTreeIndex,
+      systemAccountsOffset: systemStart,
+      args: {
+        modelHash: args.modelHash,
+        ciphertextCommitment: args.ciphertextCommitment,
+        stateVersion: args.stateVersion,
+        groth16,
+      },
+    });
+    return this.ix(args.signer, remainingAccounts, data);
+  }
+
+  private ix(
+    signer: PublicKey,
+    remaining: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[],
+    data: Uint8Array,
+  ): TransactionInstruction {
     return new TransactionInstruction({
       programId: this.programId,
-      keys: [
-        { pubkey: args.signer, isSigner: true, isWritable: true },
-        ...toRemainingAccountMetas(packed),
-      ],
-      data: encodeInstructionData(discriminator, data),
+      keys: [{ pubkey: signer, isSigner: true, isWritable: true }, ...remaining],
+      data: Buffer.from(data),
     });
   }
 }
 
-// ============================================================================
-// Internal encoding helpers
-// ============================================================================
-
-function sha256(s: string): Uint8Array {
-  // Lightweight synchronous SHA-256. For production, use `@noble/hashes`.
-  // We import dynamically to keep the bundle small.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { createHash } = require("node:crypto") as typeof import("node:crypto");
-  return createHash("sha256").update(s).digest();
-}
-
-function encodeInstructionData(discriminator: Uint8Array, data: any): Buffer {
-  // Borsh-style manual encoding. For production, use `@coral-xyz/anchor`
-  // BorshInstructionCoder. We keep this minimal here.
-  const json = JSON.stringify(data);
-  const jsonBytes = new TextEncoder().encode(json);
-  return Buffer.concat([Buffer.from(discriminator), Buffer.from(jsonBytes)]);
-}
-
-function toRemainingAccountMetas(packed: any) {
-  if (typeof packed.toAccountMetas === "function") {
-    return packed.toAccountMetas().remainingAccounts ?? [];
-  }
-  if (typeof packed.to_account_metas === "function") {
-    return packed.to_account_metas();
-  }
-  return [];
+function toLightProof(v: ValidityProof): LightValidityProof {
+  const p = v.compressedProof;
+  return { a: Uint8Array.from(p.a), b: Uint8Array.from(p.b), c: Uint8Array.from(p.c) };
 }
