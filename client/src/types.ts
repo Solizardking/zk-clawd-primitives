@@ -7,16 +7,18 @@ import type { PublicKey } from "@solana/web3.js";
 /** 32-byte field element (alt-bn128). */
 export type Bytes32 = Uint8Array & { readonly length: 32 };
 
-/** Groth16 proof triple. */
+/**
+ * Groth16 proof in groth16-solana's layout (uncompressed, big-endian).
+ * `a` must already be negated (−A). There is no verifying key here: the
+ * program only accepts proofs against its pinned keys.
+ */
 export interface Groth16Proof {
-  /** G1 point (64 bytes after endianness fix). */
+  /** −A, G1 (64 bytes). */
   a: Uint8Array;
-  /** G2 point (128 bytes). */
+  /** B, G2 (128 bytes). */
   b: Uint8Array;
-  /** G1 point (64 bytes). */
+  /** C, G1 (64 bytes). */
   c: Uint8Array;
-  /** Serialized verifying key (alpha, beta, gamma, delta, gamma_abc). */
-  verifyingKey: Uint8Array;
 }
 
 /** Inputs to the publish-attestation instruction. */
@@ -29,8 +31,10 @@ export interface PublishAttestationArgs {
   payloadCommitment: Bytes32;
   /** Nullifier that prevents double-publish. */
   nullifier: Bytes32;
-  /** Groth16 proof over (attester, model_hash, payload_commitment, nullifier). */
+  /** Groth16 proof over split128(attester, model_hash, payload_commitment, nullifier). */
   proof: Groth16Proof;
+  /** Restrict who may consume; omit for anyone. */
+  allowedConsumer?: PublicKey;
 }
 
 /** Inputs to the commit-encrypted-state instruction. */

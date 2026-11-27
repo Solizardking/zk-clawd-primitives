@@ -11,11 +11,9 @@
 
 import { test, describe, expect, vi } from "vitest";
 
-// The zk-client has a pre-existing bug: it tries to
-// `new PublicKey("CLAWDzk11…111")` at module load, and that string
-// is too short to be a valid base58 pubkey. Importing it pulls
-// that line in, so we mock the module entirely for the off-chain
-// unit tests with a minimal surface area.
+// The agent tests mock @clawd/zk-client with a minimal surface so they
+// run without a built client (dist/) or RPC. (The old invalid
+// "CLAWDzk11…111" placeholder ID has been replaced by 4vJ9JU1b….)
 vi.mock("@clawd/zk-client", () => {
   // Re-implement the small bits we exercise (nullifier computation,
   // public-input packing, proof serialization) in a way that
@@ -58,7 +56,7 @@ vi.mock("@clawd/zk-client", () => {
     return [p.attester, p.modelHash, p.payloadCommitment, p.nullifier];
   }
   function verifyGroth16Offchain(args: {
-    proof: { a: Uint8Array; b: Uint8Array; c: Uint8Array; verifyingKey: Uint8Array };
+    proof: { a: Uint8Array; b: Uint8Array; c: Uint8Array };
     publicInputs: Uint8Array[];
   }): { ok: boolean; reason?: string } {
     if (args.publicInputs.length < 1) {
@@ -116,7 +114,6 @@ function fakeProof(): Groth16Proof {
     a: new Uint8Array(64),
     b: new Uint8Array(128),
     c: new Uint8Array(64),
-    verifyingKey: new Uint8Array(0),
   };
 }
 

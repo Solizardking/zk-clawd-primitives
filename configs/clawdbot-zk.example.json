@@ -1,6 +1,6 @@
 {
   "network": "mainnet",
-  "programId": "CLAWDzk11111111111111111111111111111111111",
+  "programId": "4vJ9JU1bJJE96FWSVKmnrL3xFU5jSBSVdk9x4La2vzhn",
   "rpcUrlEnv": "CLAWD_ZK_RPC_URL",
   "photonUrlEnv": "CLAWD_ZK_PHOTON_URL",
   "commitment": "confirmed",

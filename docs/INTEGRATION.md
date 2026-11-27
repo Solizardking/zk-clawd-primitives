@@ -89,8 +89,9 @@ The catalog can show that ZK capability exists; it should not silently arm it.
 ## Production Checklist
 
 1. Replace placeholder program IDs and Light signer values with deployed IDs.
-2. Pin trusted verifying keys per circuit instead of accepting arbitrary VKs.
-3. Replace JSON instruction encoding shims with canonical Anchor/Borsh encoding.
+2. Pin trusted verifying keys per circuit in `programs/clawd-zk/src/vk.rs`
+   (slots exist and fail closed; the circuits and setup do not exist yet).
+3. ~~Replace JSON instruction encoding~~ — done: Borsh (`client/src/encoding.ts`).
 4. Run `npm test` for the TypeScript packages.
 5. Run `cargo test-sbf -p clawd-zk` with a Light-compatible validator.
 6. Publish the final `MANIFEST.json` alongside package versions and deployment IDs.
